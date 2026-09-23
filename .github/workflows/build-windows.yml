@@ -1,0 +1,137 @@
+---
+name: build-windows
+
+'on':
+  workflow_dispatch:
+  release:
+    types:
+      - published
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  mingw-x86_64:
+    name: windows-x86_64-mingw
+    runs-on: ubuntu-latest
+
+    env:
+      CMAKE_OPTS: >-
+        -Werror=dev
+        -DUSE_WERROR=ON
+        -DCMAKE_BUILD_TYPE=RelWithDebInfo
+        -DTARGET_UARCH=official
+        -DUSE_COMPILE_CACHE=ON
+      CCACHE_MAXSIZE: 0
+      CCACHE_NOCOMPRESS: 1
+
+    steps:
+      - name: Configure git
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Check out
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Set up environment
+        run: |
+          echo "CMAKE_BUILD_PARALLEL_LEVEL=$(nproc)" | tee -a "$GITHUB_ENV"
+
+      - name: Cache vcpkg dependencies
+        id: cache-deps
+        uses: actions/cache@v6
+        with:
+          key: vcpkg-mingw-x86_64-${{ hashFiles('vcpkg.json') }}
+          restore-keys: |
+            vcpkg-mingw-x86_64-
+          path: build/vcpkg_installed
+
+      - name: Cache ccache data
+        uses: actions/cache@v6
+        with:
+          key: ccache-${{ github.job }}-${{ github.ref }}-${{ github.run_id }}
+          restore-keys: |
+            ccache-${{ github.job }}-${{ github.ref }}-
+            ccache-${{ github.job }}-
+          path: ~/.cache/ccache
+
+      - name: Install MinGW dependencies
+        run: |
+          sudo .github/workflows/setup-mingw-packages.sh
+
+          sudo apt-get install -y --no-install-recommends \
+            $(xargs < .github/workflows/deps-ubuntu-24.04-mingw.txt)
+
+      - name: Configure
+        run: |
+          export VCPKG_ROOT="${VCPKG_INSTALLATION_ROOT}"
+          echo "VCPKG_ROOT=${VCPKG_ROOT}" >> "$GITHUB_ENV"
+
+          ccache --zero-stats
+
+          cmake -S . \
+            -B build \
+            -DCMAKE_TOOLCHAIN_FILE="./cmake/toolchains/x64-mingw-vcpkg.cmake" \
+            -DVCPKG_MANIFEST_INSTALL="${{ env.should_install_manifest }}" \
+            $CMAKE_OPTS
+        env:
+          should_install_manifest: >-
+            ${{ steps.cache-deps.outputs.cache-hit == 'true' && 'NO' || 'YES' }}
+
+      - name: Show compiler configuration
+        run: |
+          echo "=== CMake CPU configuration ==="
+          grep -E 'TARGET_UARCH|TARGET_UARCH_FLAGS' \
+            build/CMakeCache.txt || true
+
+          echo "=== CMake compiler ==="
+          grep -E 'CMAKE_(C|CXX)_COMPILER(:|:FILEPATH)' \
+            build/CMakeCache.txt || true
+
+          echo "=== MinGW compiler ==="
+          x86_64-w64-mingw32-gcc --version
+          x86_64-w64-mingw32-g++ --version
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Package
+        run: |
+          cmake --build build --target package
+
+      - name: Verify Windows installer
+        run: |
+          file build/lmms-*.exe
+          ls -lh build/lmms-*.exe
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v7
+        with:
+          archive: false
+          path: build/lmms-*.exe
+
+      - name: Upload Windows installer to GitHub Release
+        if: ${{ github.event_name == 'release' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          gh release upload "$RELEASE_TAG" \
+            build/lmms-*.exe \
+            --clobber
+
+      - name: Trim ccache and print statistics
+        run: |
+          ccache --cleanup
+          echo "[ccache config]"
+          ccache --show-config
+          echo "[ccache stats]"
+          ccache --show-stats
+        env:
+          CCACHE_MAXSIZE: 500M
